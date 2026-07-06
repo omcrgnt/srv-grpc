@@ -1,0 +1,10 @@
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  call-validate:
+    uses: omcrgnt/ci/.github/workflows/base-ci.yml@main
+    secrets: inherit
