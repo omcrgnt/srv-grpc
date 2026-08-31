@@ -17,8 +17,10 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 )
 
 type healthAPI struct {
@@ -65,11 +67,12 @@ func TestConfig_Build_integration(t *testing.T) {
 	server := built.(*Server[*healthAPI])
 	server.Inject([]any{api, metrics})
 
-	if err := server.Start(t.Context()); err != nil {
+	stop, err := server.Start(t.Context())
+	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = server.Close(context.Background())
+		_ = stop(context.Background())
 	})
 
 	addr := server.listener.Addr().String()
@@ -118,7 +121,7 @@ func TestConfig_Build_integration(t *testing.T) {
 		t.Fatalf("no Health/Check span among %d spans", len(spans))
 	}
 
-	if err := server.Close(t.Context()); err != nil {
+	if err := stop(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -153,8 +156,180 @@ func TestInject(t *testing.T) {
 	if got, want := reflect.TypeOf(deps[1]), reflect.TypeOf((*GRPCMetrics)(nil)); got != want {
 		t.Errorf("Deps()[1] type = %v, want %v", got, want)
 	}
+	if got, want := reflect.TypeOf(deps[2]), reflect.TypeOf((*gate)(nil)); got != want {
+		t.Errorf("Deps()[2] type = %v, want %v", got, want)
+	}
 
-	s.Inject([]any{api, metrics})
+	fg := &fakeGate{ready: true}
+	s.Inject([]any{api, metrics, gate(fg)})
+
+	if s.gate != fg {
+		t.Error("Inject: gate not set")
+	}
+}
+
+type fakeGate struct{ ready bool }
+
+func (g *fakeGate) Ready() bool { return g.ready }
+
+func TestConfig_Build_gate_stream(t *testing.T) {
+	table := []struct {
+		name     string
+		gate     *fakeGate
+		wantCode codes.Code
+	}{
+		// healthAPI embeds UnimplementedHealthServer: once the gate lets the
+		// call through, Watch itself answers Unimplemented — proving the
+		// interceptor invoked the real handler instead of short-circuiting.
+		{name: "gate not ready", gate: &fakeGate{ready: false}, wantCode: codes.Unavailable},
+		{name: "gate ready", gate: &fakeGate{ready: true}, wantCode: codes.Unimplemented},
+	}
+
+	for _, tc := range table {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, _ := testGRPCMetrics(t)
+			api := &healthAPI{}
+
+			cfg := Config[*healthAPI]{
+				Label: common.Label{Value: "test_srv"},
+				Host:  common.Host{Value: "127.0.0.1"},
+				Port:  common.Port{Value: 0},
+			}
+			built, err := cfg.Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := built.(*Server[*healthAPI])
+			server.Inject([]any{api, metrics, gate(tc.gate)})
+
+			stop, err := server.Start(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stop(context.Background()) })
+
+			addr := server.listener.Addr().String()
+			time.Sleep(50 * time.Millisecond)
+
+			conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+
+			client := grpc_health_v1.NewHealthClient(conn)
+			stream, err := client.Watch(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Both outcomes below surface server-side, on the first Recv,
+			// not on the initial Watch call itself.
+			_, err = stream.Recv()
+			if gotCode := status.Code(err); gotCode != tc.wantCode {
+				t.Errorf("code = %v, want %v", gotCode, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestConfig_Build_gate(t *testing.T) {
+	table := []struct {
+		name     string
+		gate     *fakeGate
+		wantCode codes.Code
+	}{
+		{name: "no gate wired", gate: nil, wantCode: codes.OK},
+		{name: "gate not ready", gate: &fakeGate{ready: false}, wantCode: codes.Unavailable},
+		{name: "gate ready", gate: &fakeGate{ready: true}, wantCode: codes.OK},
+	}
+
+	for _, tc := range table {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, _ := testGRPCMetrics(t)
+			api := &healthAPI{}
+
+			cfg := Config[*healthAPI]{
+				Label: common.Label{Value: "test_srv"},
+				Host:  common.Host{Value: "127.0.0.1"},
+				Port:  common.Port{Value: 0},
+			}
+			built, err := cfg.Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := built.(*Server[*healthAPI])
+
+			deps := []any{api, metrics}
+			if tc.gate != nil {
+				deps = append(deps, gate(tc.gate))
+			}
+			server.Inject(deps)
+
+			stop, err := server.Start(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stop(context.Background()) })
+
+			addr := server.listener.Addr().String()
+			time.Sleep(50 * time.Millisecond)
+
+			conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+
+			client := grpc_health_v1.NewHealthClient(conn)
+			_, err = client.Check(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+			if gotCode := status.Code(err); gotCode != tc.wantCode {
+				t.Errorf("code = %v, want %v", gotCode, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestConfig_Build_gate_disabled(t *testing.T) {
+	// A gate-not-ready would normally answer Unavailable (see
+	// TestConfig_Build_gate) — this proves DisableGate suppresses that
+	// check even with a gate injected, the case ops needs its own
+	// readiness endpoint to never be blocked by.
+	metrics, _ := testGRPCMetrics(t)
+	api := &healthAPI{}
+
+	cfg := Config[*healthAPI]{
+		Label: common.Label{Value: "test_srv"},
+		Host:  common.Host{Value: "127.0.0.1"},
+		Port:  common.Port{Value: 0},
+	}
+	built, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := built.(*Server[*healthAPI])
+	server.DisableGate()
+	server.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
+
+	stop, err := server.Start(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	addr := server.listener.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	client := grpc_health_v1.NewHealthClient(conn)
+	_, err = client.Check(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+	if gotCode := status.Code(err); gotCode != codes.OK {
+		t.Errorf("code = %v, want %v (DisableGate should suppress the gate check)", gotCode, codes.OK)
+	}
 }
 
 func TestStart_cancelledContext(t *testing.T) {
@@ -171,9 +346,12 @@ func TestStart_cancelledContext(t *testing.T) {
 		listener: ln,
 	}
 
-	err = s.Start(ctx)
+	cleanup, err := s.Start(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Start: got %v, want context.Canceled", err)
+	}
+	if cleanup != nil {
+		t.Error("Start: expected nil cleanup on failure")
 	}
 }
 
@@ -194,7 +372,7 @@ func TestHealthCheck_serveError(t *testing.T) {
 	}
 	s.Inject([]any{api, metrics})
 
-	if err := s.Start(context.Background()); err != nil {
+	if _, err := s.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -225,7 +403,7 @@ func TestProbeReady_serveError(t *testing.T) {
 	}
 	s.Inject([]any{api, metrics})
 
-	if err := s.Start(context.Background()); err != nil {
+	if _, err := s.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -255,10 +433,11 @@ func TestProbeReady_matchesHealthCheck(t *testing.T) {
 	s.Inject([]any{api, metrics})
 
 	ctx := context.Background()
-	if err := s.Start(ctx); err != nil {
+	stop, err := s.Start(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	t.Cleanup(func() { _ = stop(context.Background()) })
 
 	if err := s.ProbeReady(ctx); err != nil {
 		t.Fatalf("ProbeReady after Start: %v", err)
@@ -268,7 +447,7 @@ func TestProbeReady_matchesHealthCheck(t *testing.T) {
 	}
 }
 
-func TestClose_cancelledContext(t *testing.T) {
+func TestStop_cancelledContext(t *testing.T) {
 	metrics, _ := testGRPCMetrics(t)
 
 	hold := make(chan struct{})
@@ -293,12 +472,13 @@ func TestClose_cancelledContext(t *testing.T) {
 	server := built.(*Server[*blockingHealthAPI])
 	server.Inject([]any{api, metrics})
 
-	if err := server.Start(context.Background()); err != nil {
+	stop, err := server.Start(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		close(release)
-		_ = server.Close(context.Background())
+		_ = stop(context.Background())
 	})
 
 	addr := server.listener.Addr().String()
@@ -325,8 +505,8 @@ func TestClose_cancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := server.Close(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Close with cancelled context: got %v, want context.Canceled", err)
+	if err := stop(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stop with cancelled context: got %v, want context.Canceled", err)
 	}
 }
 
