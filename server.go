@@ -8,6 +8,7 @@ import (
 
 	"github.com/omcrgnt/app"
 	common "github.com/omcrgnt/proto/gen/go/common/v1"
+	"github.com/omcrgnt/res/gate"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/atomic"
@@ -43,24 +44,19 @@ func (cfg *Config[T]) Build() (any, error) {
 // Catalog field: *Server[T] (Configurable); materialized *Server[T] is the runtime instance after [Config].Build.
 // Runtime methods: Start (returns a cleanup that stops the server), HealthCheck, ProbeReady.
 type Server[T GRPCRegistrar] struct {
-	grpc         *grpc.Server
-	listener     net.Listener
-	handler      T
-	metrics      *GRPCMetrics
-	gate         gate
-	gateDisabled bool
-	label        string
-	err          atomic.Error
+	grpc     *grpc.Server
+	listener net.Listener
+	handler  T
+	metrics  *GRPCMetrics
+	gate     gate.Switch
+	label    string
+	err      atomic.Error
 }
-
-// gate reports whether traffic should be let through — no runner import;
-// duck-typed against runner.Gate's Ready() bool.
-type gate interface{ Ready() bool }
 
 // gateCheckErr returns a codes.Unavailable error if g reports not ready,
 // nil otherwise — shared by both interceptors below so the error format
 // only needs to change in one place.
-func gateCheckErr(g gate) error {
+func gateCheckErr(g gate.Gate) error {
 	if !g.Ready() {
 		return status.Error(codes.Unavailable, "not ready")
 	}
@@ -69,7 +65,7 @@ func gateCheckErr(g gate) error {
 
 // gateUnaryInterceptor answers codes.Unavailable instead of calling handler
 // while g reports not ready.
-func gateUnaryInterceptor(g gate) grpc.UnaryServerInterceptor {
+func gateUnaryInterceptor(g gate.Gate) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if err := gateCheckErr(g); err != nil {
 			return nil, err
@@ -79,7 +75,7 @@ func gateUnaryInterceptor(g gate) grpc.UnaryServerInterceptor {
 }
 
 // gateStreamInterceptor is gateUnaryInterceptor for streaming RPCs.
-func gateStreamInterceptor(g gate) grpc.StreamServerInterceptor {
+func gateStreamInterceptor(g gate.Gate) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if err := gateCheckErr(g); err != nil {
 			return err
@@ -99,17 +95,17 @@ func (*Server[T]) BuildConfig() (app.Materializer, error) {
 // listener).
 //
 // Must be called before Start, synchronously by the same caller that wires
-// this Server: Start reads gateDisabled once, while building the
-// interceptor chain, and never again — a call after Start has already run
-// is a silent no-op, not an error.
-func (t *Server[T]) DisableGate() { t.gateDisabled = true }
+// this Server: Start reads t.gate once, while building the interceptor
+// chain, and never again — a call after Start has already run is a silent
+// no-op, not an error.
+func (t *Server[T]) DisableGate() { t.gate.Disable() }
 
 func (t *Server[T]) Deps() []any {
 	var handler T
 	return []any{
 		handler,
 		(*GRPCMetrics)(nil),
-		(*gate)(nil),
+		(*gate.Gate)(nil),
 	}
 }
 
@@ -120,8 +116,8 @@ func (t *Server[T]) Inject(args []any) {
 			t.handler = v
 		case *GRPCMetrics:
 			t.metrics = v
-		case gate:
-			t.gate = v
+		case gate.Gate:
+			t.gate.Set(v)
 		}
 	}
 }
@@ -135,16 +131,25 @@ func (t *Server[T]) Start(ctx context.Context) (func(context.Context) error, err
 		_ = t.listener.Close()
 		return nil, ctx.Err()
 	default:
+		// metrics, then gate: metrics is the outer wrapper, so a request the
+		// gate rejects (Unavailable, handler never called) is still observed
+		// by the metrics interceptor as a handled RPC — with that status and
+		// a near-zero duration, not silently dropped. Expected during
+		// startup (the gate opens once, after every runner.Starter has
+		// started), but worth knowing if you own grpc_server_handled_total
+		// dashboards/alerts: a startup window can show a burst of
+		// Unavailable that never reached real handler logic.
 		var unaryInterceptors []grpc.UnaryServerInterceptor
 		var streamInterceptors []grpc.StreamServerInterceptor
 		if t.metrics != nil {
 			unaryInterceptors = append(unaryInterceptors, t.metrics.UnaryServerInterceptor())
 			streamInterceptors = append(streamInterceptors, t.metrics.StreamServerInterceptor())
 		}
-		if t.gate != nil && !t.gateDisabled {
-			unaryInterceptors = append(unaryInterceptors, gateUnaryInterceptor(t.gate))
-			streamInterceptors = append(streamInterceptors, gateStreamInterceptor(t.gate))
-		}
+		// Always append: t.gate.Ready() already reports true when no Gate is
+		// wired or DisableGate was called, so this is a no-op in those
+		// cases — no separate nil/disabled check needed here.
+		unaryInterceptors = append(unaryInterceptors, gateUnaryInterceptor(&t.gate))
+		streamInterceptors = append(streamInterceptors, gateStreamInterceptor(&t.gate))
 
 		opts := []grpc.ServerOption{
 			grpc.ChainUnaryInterceptor(unaryInterceptors...),
@@ -204,7 +209,7 @@ func (t *Server[T]) ProbeReady(ctx context.Context) error {
 	if err := t.HealthCheck(ctx); err != nil {
 		return err
 	}
-	if t.gate != nil && !t.gateDisabled && !t.gate.Ready() {
+	if !t.gate.Ready() {
 		return errors.New("srvgrpc: gate not ready")
 	}
 	return nil
