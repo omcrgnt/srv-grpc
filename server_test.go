@@ -11,6 +11,8 @@ import (
 	"time"
 
 	common "github.com/omcrgnt/proto/gen/go/common/v1"
+	"github.com/omcrgnt/res/unique"
+	"github.com/omcrgnt/sdi"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/otel"
@@ -171,6 +173,64 @@ func TestInject(t *testing.T) {
 type fakeGate struct{ ready bool }
 
 func (g *fakeGate) Ready() bool { return g.ready }
+
+// TestServer_SDIResolve_requiresGate pins the consequence of Deps declaring
+// (*gate)(nil) as a single, required dependency (not a many-dep slice):
+// sdi.Resolve must fail outright if nothing implementing gate is
+// registered, not silently wire a nil gate. Every other test in this file
+// only exercises manual Inject, which can't catch this — sdi.Resolve is a
+// separate code path with its own dependency-satisfaction checks.
+func TestServer_SDIResolve_requiresGate(t *testing.T) {
+	reg := unique.New()
+	reg.MustAddFixed(&GRPCMetrics{})
+	reg.MustAddFixed(&healthAPI{})
+
+	cfg := &Config[*healthAPI]{
+		Label: common.Label{Value: "test_srv"},
+		Host:  common.Host{Value: "127.0.0.1"},
+		Port:  common.Port{Value: 0},
+	}
+	built, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = built.(*Server[*healthAPI]).listener.Close() })
+	reg.MustAddReplaceable(built)
+
+	if err := sdi.Resolve(reg); err == nil {
+		t.Fatal("sdi.Resolve: expected an error — no gate-compatible resource registered")
+	}
+}
+
+// TestServer_SDIResolve_withGate is the successful counterpart: a real
+// sdi.Resolve pass actually wires the gate dependency through, not just
+// manual Inject.
+func TestServer_SDIResolve_withGate(t *testing.T) {
+	reg := unique.New()
+	reg.MustAddFixed(&GRPCMetrics{})
+	reg.MustAddFixed(&healthAPI{})
+	reg.MustAddFixed(&fakeGate{ready: true})
+
+	cfg := &Config[*healthAPI]{
+		Label: common.Label{Value: "test_srv"},
+		Host:  common.Host{Value: "127.0.0.1"},
+		Port:  common.Port{Value: 0},
+	}
+	built, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := built.(*Server[*healthAPI])
+	t.Cleanup(func() { _ = server.listener.Close() })
+	reg.MustAddReplaceable(built)
+
+	if err := sdi.Resolve(reg); err != nil {
+		t.Fatalf("sdi.Resolve: %v", err)
+	}
+	if server.gate == nil {
+		t.Fatal("gate was not wired by sdi.Resolve")
+	}
+}
 
 func TestConfig_Build_gate_stream(t *testing.T) {
 	table := []struct {
@@ -353,6 +413,40 @@ func TestStart_cancelledContext(t *testing.T) {
 	if cleanup != nil {
 		t.Error("Start: expected nil cleanup on failure")
 	}
+	// Start returns no cleanup on this path, so the listener Build already
+	// opened would otherwise never be closed by anything — Accept must fail
+	// on a closed listener. Bounded deadline instead of a bare blocking
+	// Accept: if this regresses to leaking the listener again, Accept would
+	// otherwise block forever instead of failing the test.
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := ln.Accept(); err == nil {
+		t.Error("Start: listener was not closed on the already-cancelled-ctx path — fd leak")
+	} else if !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Errorf("Start: Accept error = %v, want \"use of closed network connection\" (got a deadline timeout instead — listener was never closed)", err)
+	}
+}
+
+// TestStart_nilMetrics_doesNotPanic: Deps declares *GRPCMetrics as required,
+// so under normal sdi.Resolve wiring it's never nil at Start — but Start
+// shouldn't panic if a caller bypasses that (as this test deliberately
+// does), matching the existing nil-guard on t.gate one line below in the
+// real code.
+func TestStart_nilMetrics_doesNotPanic(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	api := &healthAPI{}
+	s := &Server[*healthAPI]{listener: ln}
+	s.Inject([]any{api}) // deliberately no metrics
+
+	stop, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
 }
 
 func TestHealthCheck_serveError(t *testing.T) {
@@ -444,6 +538,69 @@ func TestProbeReady_matchesHealthCheck(t *testing.T) {
 	}
 	if err := s.HealthCheck(ctx); err != nil {
 		t.Fatalf("HealthCheck after Start: %v", err)
+	}
+}
+
+// TestProbeReady_gateNotReady: HealthCheck alone (t.err) can't see this —
+// Serve hasn't failed, only the gate hasn't opened yet. Without ProbeReady
+// also consulting the gate, a k8s readiness probe would mark this pod Ready
+// while every real RPC is still answered Unavailable by the gate
+// interceptor.
+func TestProbeReady_gateNotReady(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	metrics, _ := testGRPCMetrics(t)
+	api := &healthAPI{}
+
+	s := &Server[*healthAPI]{listener: ln}
+	s.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
+
+	ctx := context.Background()
+	stop, err := s.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	if err := s.ProbeReady(ctx); err == nil {
+		t.Fatal("ProbeReady: expected error while gate is not ready, got nil")
+	}
+	// HealthCheck alone is unaffected — Serve itself hasn't failed.
+	if err := s.HealthCheck(ctx); err != nil {
+		t.Fatalf("HealthCheck: got %v, want nil (gate readiness is ProbeReady's concern, not HealthCheck's)", err)
+	}
+}
+
+// TestProbeReady_gateDisabled_ignoresNotReadyGate mirrors
+// TestConfig_Build_gate_disabled at the ProbeReady level: DisableGate must
+// suppress the gate check here too, not just in the RPC interceptors.
+func TestProbeReady_gateDisabled_ignoresNotReadyGate(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	metrics, _ := testGRPCMetrics(t)
+	api := &healthAPI{}
+
+	s := &Server[*healthAPI]{listener: ln}
+	s.DisableGate()
+	s.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
+
+	ctx := context.Background()
+	stop, err := s.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	if err := s.ProbeReady(ctx); err != nil {
+		t.Fatalf("ProbeReady: got %v, want nil (DisableGate should suppress the gate check)", err)
 	}
 }
 
