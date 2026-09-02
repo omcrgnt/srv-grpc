@@ -11,7 +11,6 @@ import (
 	"time"
 
 	common "github.com/omcrgnt/proto/gen/go/common/v1"
-	"github.com/omcrgnt/res/gate"
 	"github.com/omcrgnt/res/unique"
 	"github.com/omcrgnt/sdi"
 	"github.com/prometheus/client_golang/prometheus"
@@ -159,19 +158,15 @@ func TestInject(t *testing.T) {
 	if got, want := reflect.TypeOf(deps[1]), reflect.TypeOf((*GRPCMetrics)(nil)); got != want {
 		t.Errorf("Deps()[1] type = %v, want %v", got, want)
 	}
-	if got, want := reflect.TypeOf(deps[2]), reflect.TypeOf((*gate.Gate)(nil)); got != want {
+	if got, want := reflect.TypeOf(deps[2]), reflect.TypeOf((*gate)(nil)); got != want {
 		t.Errorf("Deps()[2] type = %v, want %v", got, want)
 	}
 
-	// ready:false is deliberate: a not-yet-wired gate.Switch reports Ready()
-	// == true (see gate.Switch's own doc), so this value is the only one
-	// that can distinguish "gate wired" from "gate never wired" here —
-	// Switch has no exported way to compare identity directly.
-	fg := &fakeGate{ready: false}
-	s.Inject([]any{api, metrics, gate.Gate(fg)})
+	fg := &fakeGate{ready: true}
+	s.Inject([]any{api, metrics, gate(fg)})
 
-	if s.gate.Ready() {
-		t.Error("Inject: gate not set (Switch still reports Ready with no gate wired)")
+	if s.gate != fg {
+		t.Error("Inject: gate not set")
 	}
 }
 
@@ -232,8 +227,8 @@ func TestServer_SDIResolve_withGate(t *testing.T) {
 	if err := sdi.Resolve(reg); err != nil {
 		t.Fatalf("sdi.Resolve: %v", err)
 	}
-	if !server.gate.Ready() {
-		t.Fatal("gate was not wired by sdi.Resolve (or was wired but reports not ready)")
+	if server.gate == nil {
+		t.Fatal("gate was not wired by sdi.Resolve")
 	}
 }
 
@@ -265,7 +260,7 @@ func TestConfig_Build_gate_stream(t *testing.T) {
 				t.Fatal(err)
 			}
 			server := built.(*Server[*healthAPI])
-			server.Inject([]any{api, metrics, gate.Gate(tc.gate)})
+			server.Inject([]any{api, metrics, gate(tc.gate)})
 
 			stop, err := server.Start(t.Context())
 			if err != nil {
@@ -326,7 +321,7 @@ func TestConfig_Build_gate(t *testing.T) {
 
 			deps := []any{api, metrics}
 			if tc.gate != nil {
-				deps = append(deps, gate.Gate(tc.gate))
+				deps = append(deps, gate(tc.gate))
 			}
 			server.Inject(deps)
 
@@ -373,7 +368,7 @@ func TestConfig_Build_gate_disabled(t *testing.T) {
 	}
 	server := built.(*Server[*healthAPI])
 	server.DisableGate()
-	server.Inject([]any{api, metrics, gate.Gate(&fakeGate{ready: false})})
+	server.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
 
 	stop, err := server.Start(t.Context())
 	if err != nil {
@@ -562,7 +557,7 @@ func TestProbeReady_gateNotReady(t *testing.T) {
 	api := &healthAPI{}
 
 	s := &Server[*healthAPI]{listener: ln}
-	s.Inject([]any{api, metrics, gate.Gate(&fakeGate{ready: false})})
+	s.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
 
 	ctx := context.Background()
 	stop, err := s.Start(ctx)
@@ -595,7 +590,7 @@ func TestProbeReady_gateDisabled_ignoresNotReadyGate(t *testing.T) {
 
 	s := &Server[*healthAPI]{listener: ln}
 	s.DisableGate()
-	s.Inject([]any{api, metrics, gate.Gate(&fakeGate{ready: false})})
+	s.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
 
 	ctx := context.Background()
 	stop, err := s.Start(ctx)
