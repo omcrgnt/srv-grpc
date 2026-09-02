@@ -11,14 +11,18 @@ import (
 	"time"
 
 	common "github.com/omcrgnt/proto/gen/go/common/v1"
+	"github.com/omcrgnt/res/unique"
+	"github.com/omcrgnt/sdi"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 )
 
 type healthAPI struct {
@@ -65,11 +69,12 @@ func TestConfig_Build_integration(t *testing.T) {
 	server := built.(*Server[*healthAPI])
 	server.Inject([]any{api, metrics})
 
-	if err := server.Start(t.Context()); err != nil {
+	stop, err := server.Start(t.Context())
+	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = server.Close(context.Background())
+		_ = stop(context.Background())
 	})
 
 	addr := server.listener.Addr().String()
@@ -118,7 +123,7 @@ func TestConfig_Build_integration(t *testing.T) {
 		t.Fatalf("no Health/Check span among %d spans", len(spans))
 	}
 
-	if err := server.Close(t.Context()); err != nil {
+	if err := stop(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -153,8 +158,238 @@ func TestInject(t *testing.T) {
 	if got, want := reflect.TypeOf(deps[1]), reflect.TypeOf((*GRPCMetrics)(nil)); got != want {
 		t.Errorf("Deps()[1] type = %v, want %v", got, want)
 	}
+	if got, want := reflect.TypeOf(deps[2]), reflect.TypeOf((*gate)(nil)); got != want {
+		t.Errorf("Deps()[2] type = %v, want %v", got, want)
+	}
 
-	s.Inject([]any{api, metrics})
+	fg := &fakeGate{ready: true}
+	s.Inject([]any{api, metrics, gate(fg)})
+
+	if s.gate != fg {
+		t.Error("Inject: gate not set")
+	}
+}
+
+type fakeGate struct{ ready bool }
+
+func (g *fakeGate) Ready() bool { return g.ready }
+
+// TestServer_SDIResolve_requiresGate pins the consequence of Deps declaring
+// (*gate)(nil) as a single, required dependency (not a many-dep slice):
+// sdi.Resolve must fail outright if nothing implementing gate is
+// registered, not silently wire a nil gate. Every other test in this file
+// only exercises manual Inject, which can't catch this — sdi.Resolve is a
+// separate code path with its own dependency-satisfaction checks.
+func TestServer_SDIResolve_requiresGate(t *testing.T) {
+	reg := unique.New()
+	reg.MustAddFixed(&GRPCMetrics{})
+	reg.MustAddFixed(&healthAPI{})
+
+	cfg := &Config[*healthAPI]{
+		Label: common.Label{Value: "test_srv"},
+		Host:  common.Host{Value: "127.0.0.1"},
+		Port:  common.Port{Value: 0},
+	}
+	built, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = built.(*Server[*healthAPI]).listener.Close() })
+	reg.MustAddReplaceable(built)
+
+	if err := sdi.Resolve(reg); err == nil {
+		t.Fatal("sdi.Resolve: expected an error — no gate-compatible resource registered")
+	}
+}
+
+// TestServer_SDIResolve_withGate is the successful counterpart: a real
+// sdi.Resolve pass actually wires the gate dependency through, not just
+// manual Inject.
+func TestServer_SDIResolve_withGate(t *testing.T) {
+	reg := unique.New()
+	reg.MustAddFixed(&GRPCMetrics{})
+	reg.MustAddFixed(&healthAPI{})
+	reg.MustAddFixed(&fakeGate{ready: true})
+
+	cfg := &Config[*healthAPI]{
+		Label: common.Label{Value: "test_srv"},
+		Host:  common.Host{Value: "127.0.0.1"},
+		Port:  common.Port{Value: 0},
+	}
+	built, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := built.(*Server[*healthAPI])
+	t.Cleanup(func() { _ = server.listener.Close() })
+	reg.MustAddReplaceable(built)
+
+	if err := sdi.Resolve(reg); err != nil {
+		t.Fatalf("sdi.Resolve: %v", err)
+	}
+	if server.gate == nil {
+		t.Fatal("gate was not wired by sdi.Resolve")
+	}
+}
+
+func TestConfig_Build_gate_stream(t *testing.T) {
+	table := []struct {
+		name     string
+		gate     *fakeGate
+		wantCode codes.Code
+	}{
+		// healthAPI embeds UnimplementedHealthServer: once the gate lets the
+		// call through, Watch itself answers Unimplemented — proving the
+		// interceptor invoked the real handler instead of short-circuiting.
+		{name: "gate not ready", gate: &fakeGate{ready: false}, wantCode: codes.Unavailable},
+		{name: "gate ready", gate: &fakeGate{ready: true}, wantCode: codes.Unimplemented},
+	}
+
+	for _, tc := range table {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, _ := testGRPCMetrics(t)
+			api := &healthAPI{}
+
+			cfg := Config[*healthAPI]{
+				Label: common.Label{Value: "test_srv"},
+				Host:  common.Host{Value: "127.0.0.1"},
+				Port:  common.Port{Value: 0},
+			}
+			built, err := cfg.Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := built.(*Server[*healthAPI])
+			server.Inject([]any{api, metrics, gate(tc.gate)})
+
+			stop, err := server.Start(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stop(context.Background()) })
+
+			addr := server.listener.Addr().String()
+			time.Sleep(50 * time.Millisecond)
+
+			conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+
+			client := grpc_health_v1.NewHealthClient(conn)
+			stream, err := client.Watch(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Both outcomes below surface server-side, on the first Recv,
+			// not on the initial Watch call itself.
+			_, err = stream.Recv()
+			if gotCode := status.Code(err); gotCode != tc.wantCode {
+				t.Errorf("code = %v, want %v", gotCode, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestConfig_Build_gate(t *testing.T) {
+	table := []struct {
+		name     string
+		gate     *fakeGate
+		wantCode codes.Code
+	}{
+		{name: "no gate wired", gate: nil, wantCode: codes.OK},
+		{name: "gate not ready", gate: &fakeGate{ready: false}, wantCode: codes.Unavailable},
+		{name: "gate ready", gate: &fakeGate{ready: true}, wantCode: codes.OK},
+	}
+
+	for _, tc := range table {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, _ := testGRPCMetrics(t)
+			api := &healthAPI{}
+
+			cfg := Config[*healthAPI]{
+				Label: common.Label{Value: "test_srv"},
+				Host:  common.Host{Value: "127.0.0.1"},
+				Port:  common.Port{Value: 0},
+			}
+			built, err := cfg.Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := built.(*Server[*healthAPI])
+
+			deps := []any{api, metrics}
+			if tc.gate != nil {
+				deps = append(deps, gate(tc.gate))
+			}
+			server.Inject(deps)
+
+			stop, err := server.Start(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stop(context.Background()) })
+
+			addr := server.listener.Addr().String()
+			time.Sleep(50 * time.Millisecond)
+
+			conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+
+			client := grpc_health_v1.NewHealthClient(conn)
+			_, err = client.Check(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+			if gotCode := status.Code(err); gotCode != tc.wantCode {
+				t.Errorf("code = %v, want %v", gotCode, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestConfig_Build_gate_disabled(t *testing.T) {
+	// A gate-not-ready would normally answer Unavailable (see
+	// TestConfig_Build_gate) — this proves DisableGate suppresses that
+	// check even with a gate injected, the case ops needs its own
+	// readiness endpoint to never be blocked by.
+	metrics, _ := testGRPCMetrics(t)
+	api := &healthAPI{}
+
+	cfg := Config[*healthAPI]{
+		Label: common.Label{Value: "test_srv"},
+		Host:  common.Host{Value: "127.0.0.1"},
+		Port:  common.Port{Value: 0},
+	}
+	built, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := built.(*Server[*healthAPI])
+	server.DisableGate()
+	server.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
+
+	stop, err := server.Start(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	addr := server.listener.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	client := grpc_health_v1.NewHealthClient(conn)
+	_, err = client.Check(t.Context(), &grpc_health_v1.HealthCheckRequest{})
+	if gotCode := status.Code(err); gotCode != codes.OK {
+		t.Errorf("code = %v, want %v (DisableGate should suppress the gate check)", gotCode, codes.OK)
+	}
 }
 
 func TestStart_cancelledContext(t *testing.T) {
@@ -171,10 +406,47 @@ func TestStart_cancelledContext(t *testing.T) {
 		listener: ln,
 	}
 
-	err = s.Start(ctx)
+	cleanup, err := s.Start(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Start: got %v, want context.Canceled", err)
 	}
+	if cleanup != nil {
+		t.Error("Start: expected nil cleanup on failure")
+	}
+	// Start returns no cleanup on this path, so the listener Build already
+	// opened would otherwise never be closed by anything — Accept must fail
+	// on a closed listener. Bounded deadline instead of a bare blocking
+	// Accept: if this regresses to leaking the listener again, Accept would
+	// otherwise block forever instead of failing the test.
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := ln.Accept(); err == nil {
+		t.Error("Start: listener was not closed on the already-cancelled-ctx path — fd leak")
+	} else if !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Errorf("Start: Accept error = %v, want \"use of closed network connection\" (got a deadline timeout instead — listener was never closed)", err)
+	}
+}
+
+// TestStart_nilMetrics_doesNotPanic: Deps declares *GRPCMetrics as required,
+// so under normal sdi.Resolve wiring it's never nil at Start — but Start
+// shouldn't panic if a caller bypasses that (as this test deliberately
+// does), matching the existing nil-guard on t.gate one line below in the
+// real code.
+func TestStart_nilMetrics_doesNotPanic(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	api := &healthAPI{}
+	s := &Server[*healthAPI]{listener: ln}
+	s.Inject([]any{api}) // deliberately no metrics
+
+	stop, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
 }
 
 func TestHealthCheck_serveError(t *testing.T) {
@@ -194,7 +466,7 @@ func TestHealthCheck_serveError(t *testing.T) {
 	}
 	s.Inject([]any{api, metrics})
 
-	if err := s.Start(context.Background()); err != nil {
+	if _, err := s.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -225,7 +497,7 @@ func TestProbeReady_serveError(t *testing.T) {
 	}
 	s.Inject([]any{api, metrics})
 
-	if err := s.Start(context.Background()); err != nil {
+	if _, err := s.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -255,10 +527,11 @@ func TestProbeReady_matchesHealthCheck(t *testing.T) {
 	s.Inject([]any{api, metrics})
 
 	ctx := context.Background()
-	if err := s.Start(ctx); err != nil {
+	stop, err := s.Start(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	t.Cleanup(func() { _ = stop(context.Background()) })
 
 	if err := s.ProbeReady(ctx); err != nil {
 		t.Fatalf("ProbeReady after Start: %v", err)
@@ -268,7 +541,70 @@ func TestProbeReady_matchesHealthCheck(t *testing.T) {
 	}
 }
 
-func TestClose_cancelledContext(t *testing.T) {
+// TestProbeReady_gateNotReady: HealthCheck alone (t.err) can't see this —
+// Serve hasn't failed, only the gate hasn't opened yet. Without ProbeReady
+// also consulting the gate, a k8s readiness probe would mark this pod Ready
+// while every real RPC is still answered Unavailable by the gate
+// interceptor.
+func TestProbeReady_gateNotReady(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	metrics, _ := testGRPCMetrics(t)
+	api := &healthAPI{}
+
+	s := &Server[*healthAPI]{listener: ln}
+	s.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
+
+	ctx := context.Background()
+	stop, err := s.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	if err := s.ProbeReady(ctx); err == nil {
+		t.Fatal("ProbeReady: expected error while gate is not ready, got nil")
+	}
+	// HealthCheck alone is unaffected — Serve itself hasn't failed.
+	if err := s.HealthCheck(ctx); err != nil {
+		t.Fatalf("HealthCheck: got %v, want nil (gate readiness is ProbeReady's concern, not HealthCheck's)", err)
+	}
+}
+
+// TestProbeReady_gateDisabled_ignoresNotReadyGate mirrors
+// TestConfig_Build_gate_disabled at the ProbeReady level: DisableGate must
+// suppress the gate check here too, not just in the RPC interceptors.
+func TestProbeReady_gateDisabled_ignoresNotReadyGate(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	metrics, _ := testGRPCMetrics(t)
+	api := &healthAPI{}
+
+	s := &Server[*healthAPI]{listener: ln}
+	s.DisableGate()
+	s.Inject([]any{api, metrics, gate(&fakeGate{ready: false})})
+
+	ctx := context.Background()
+	stop, err := s.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	if err := s.ProbeReady(ctx); err != nil {
+		t.Fatalf("ProbeReady: got %v, want nil (DisableGate should suppress the gate check)", err)
+	}
+}
+
+func TestStop_cancelledContext(t *testing.T) {
 	metrics, _ := testGRPCMetrics(t)
 
 	hold := make(chan struct{})
@@ -293,12 +629,13 @@ func TestClose_cancelledContext(t *testing.T) {
 	server := built.(*Server[*blockingHealthAPI])
 	server.Inject([]any{api, metrics})
 
-	if err := server.Start(context.Background()); err != nil {
+	stop, err := server.Start(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		close(release)
-		_ = server.Close(context.Background())
+		_ = stop(context.Background())
 	})
 
 	addr := server.listener.Addr().String()
@@ -325,8 +662,8 @@ func TestClose_cancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := server.Close(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Close with cancelled context: got %v, want context.Canceled", err)
+	if err := stop(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stop with cancelled context: got %v, want context.Canceled", err)
 	}
 }
 
