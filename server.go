@@ -26,6 +26,10 @@ type Config[T GRPCRegistrar] struct {
 	Label common.Label
 	Host  common.Host
 	Port  common.Port
+
+	// extraUnary carries New's options through to Build — unexported, so
+	// ecfg's reflection-based walker can't set it and leaves it alone.
+	extraUnary []grpc.UnaryServerInterceptor
 }
 
 func (cfg *Config[T]) Build() (any, error) {
@@ -34,8 +38,9 @@ func (cfg *Config[T]) Build() (any, error) {
 		return nil, err
 	}
 	return &Server[T]{
-		label:    cfg.Label.GetValue(),
-		listener: listener,
+		label:      cfg.Label.GetValue(),
+		listener:   listener,
+		extraUnary: cfg.extraUnary,
 	}, nil
 }
 
@@ -51,6 +56,42 @@ type Server[T GRPCRegistrar] struct {
 	gateDisabled bool
 	label        string
 	err          atomic.Error
+
+	// extraUnary is set via New/WithUnaryServerInterceptors, carried through
+	// BuildConfig -> Config -> Build — see client-grpc's Client.New doc
+	// comment for why the catalog field must be constructed non-nil for
+	// this to survive at all.
+	extraUnary []grpc.UnaryServerInterceptor
+}
+
+// Option configures a Server at construction time, for values ecfg can't
+// fill (e.g. interceptor functions) — see New.
+type Option[T GRPCRegistrar] func(*Server[T])
+
+// WithUnaryServerInterceptors appends interceptors run in addition to (not
+// instead of) the metrics/gate interceptors this package always installs,
+// in the order given (grpc.ChainUnaryInterceptor semantics: first listed
+// runs outermost).
+func WithUnaryServerInterceptors[T GRPCRegistrar](in ...grpc.UnaryServerInterceptor) Option[T] {
+	return func(s *Server[T]) { s.extraUnary = append(s.extraUnary, in...) }
+}
+
+// New constructs a Server[T] with the given options applied. The catalog
+// field holding it must be assigned this (non-nil) in the app's resources
+// literal — left nil (the zero-value default), these options are lost when
+// Build constructs a fresh instance. See client-grpc's Client.New.
+func New[T GRPCRegistrar](opts ...Option[T]) *Server[T] {
+	s := &Server[T]{}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// BuildConfig returns the config spec for materialize, carrying over
+// whatever options New was called with.
+func (t *Server[T]) BuildConfig() (app.Materializer, error) {
+	return &Config[T]{extraUnary: t.extraUnary}, nil
 }
 
 // gate reports whether traffic should be let through — no runner import;
@@ -86,10 +127,6 @@ func gateStreamInterceptor(g gate) grpc.StreamServerInterceptor {
 		}
 		return handler(srv, ss)
 	}
-}
-
-func (*Server[T]) BuildConfig() (app.Materializer, error) {
-	return &Config[T]{}, nil
 }
 
 // DisableGate permanently turns off gate-checking for this instance — for
@@ -153,6 +190,7 @@ func (t *Server[T]) Start(ctx context.Context) (func(context.Context) error, err
 			unaryInterceptors = append(unaryInterceptors, gateUnaryInterceptor(t.gate))
 			streamInterceptors = append(streamInterceptors, gateStreamInterceptor(t.gate))
 		}
+		unaryInterceptors = append(unaryInterceptors, t.extraUnary...)
 
 		opts := []grpc.ServerOption{
 			grpc.ChainUnaryInterceptor(unaryInterceptors...),
